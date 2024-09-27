@@ -1,283 +1,190 @@
----
-- name: Playboook to configure the master node with kubernetes
-  hosts: all
-  become: true
-  vars:
-    - kube_version: v1.28
-    - calico_version: v3.25.0
+- hosts: all
+  become: 'yes'
   tasks:
-    - name: Update and Upgrade the apt packages before proceeding
-      block:
-        - name: performing the Update
-          ansible.builtin.apt:
-            update_cache: true
+    - name: update APT packages
+      apt:
+        update_cache: 'yes'
+    - name: apply sysctl params without reboot
+      command: sysctl --system
 
-    - name: Block to manage Swap space
-      block:
-        - name: Check for swap to be on
-          ansible.builtin.shell: "swapon -s | wc -l"
-          register: number_of_swap
-          changed_when: false
-
-        - name: Turning off swaps
-          ansible.builtin.shell: "swapoff -a"
-          when: number_of_swap.stdout != 0
-
-        - name: Check for swap in /etc/fstab
-          ansible.builtin.shell: "sudo cat /etc/fstab | awk '{print $3}' | grep swap | wc -l"
-          register: number_in_fstab
-          changed_when: false
-
-        - name: Changing entries in fstab
-          ansible.builtin.lineinfile:
-            path: /etc/fstab
-            regexp: '.*swap.*'
-            line: '# \g<0>'
-          when: number_in_fstab.stdout != '0'
-    
-    - name: Change the hostname 
+    - name: disable SWAP (Kubeadm requirement)
+      shell: |
+        swapoff -a
+    - name: disable SWAP in fstab (Kubeadm requirement)
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*?\sswap\s+sw\s+.*)$'
+        replace: '# \1'
+    - name: Set the hostname for master node
       ansible.builtin.hostname:
         name: master
-    
-    - name: Making neccesary changes in the etc hosts file
+    - name: Update the /etc/hosts file with master entry
       ansible.builtin.lineinfile:
         path: /etc/hosts
-        line: "192.168.56.113 master"
+        line: '{{ hostvars[''master''].ansible_host }} master'
         state: present
+    - name: create an empty file for the Containerd module
+      copy:
+        content: ''
+        dest: /etc/modules-load.d/containerd.conf
+        force: 'no'
+    - name: configure modules for Containerd
+      blockinfile:
+        path: /etc/modules-load.d/containerd.conf
+        block: |
+          overlay
+          br_netfilter
+    - name: create an empty file for Kubernetes sysctl params
+      copy:
+        content: ''
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+        force: 'no'
+    - name: configure sysctl params for Kubernetes
+      lineinfile:
+        path: /etc/sysctl.d/99-kubernetes-cri.conf
+        line: '{{ item }}'
+      with_items:
+        - net.bridge.bridge-nf-call-iptables = 1
+        - net.ipv4.ip_forward = 1
+        - net.bridge.bridge-nf-call-ip6tables = 1
+    - name: apply sysctl params without reboot
+      command: sysctl --system
 
-    - name: Configure the sysctl for kubernetes
-      ansible.builtin.shell: "{{ item }}"
-      loop:
-        - "echo 'net.bridge.bridge-nf-call-ip6tables = 1' | tee /etc/sysctl.d/k8s.conf"
-        - "echo 'net.bridge.bridge-nf-call-iptables = 1' | tee -a /etc/sysctl.d/k8s.conf"
-        - "sysctl --system"
-      ignore_errors: yes
-    
-    - name: Check if br_netfilter is set
-      ansible.builtin.shell: "lsmod | grep br_net | wc -l"
-      register: lsmod_results
-
-    - name: Load br_netfilter module
-      ansible.builtin.shell: "{{ item }}"
-      loop:
-        - "echo 'br_netfilter' | tee /etc/modules-load.d/k8s.conf"
-        - "modprobe br_netfilter"
-      ignore_errors: yes
-      when: lsmod_results.stdout != '2'
-
-    - name: Checking for ip_forward configurations
-      ansible.builtin.shell: "cat /proc/sys/net/ipv4/ip_forward"
-      register: ip_forward_result
-      changed_when: false
-
-    - name: Forward IP persistently if required
-      block:
-        - name: Forwarding the IP in sysctl
-          ansible.builtin.lineinfile:
-            path: /etc/sysctl.conf
-            line: "net.ipv4.ip_forward=1"
-            state: present
-          register: forwarded 
-        
-        - name: Change the ip_forward for runtime
-          ansible.builtin.shell: "sysctl -w net.ipv4.ip_forward=1"
-          
-        - name: Reloading the sysctl config
-          ansible.builtin.shell: "sysctl -p /etc/sysctl.conf"
-          when: forwarded is changed 
-      when: ip_forward_result.stdout != '1'
-    
-    - name: Check and Remove docker if previous versions exist 
-      block:
-        - name: Remove the docker and containerd package
-          ansible.builtin.apt:
-            name:
-              - docker.io
-            state: absent
-
-    - name: Add the apt repository of containerd and Install containerd runtime
-      block:
-        - name: Check if keyring is already present
-          ansible.builtin.stat:
-            path: /usr/share/keyrings/docker.gpg
-          register: containerd_keyring_present
-
-        - name: Adding the Containerd repo key
-          ansible.builtin.apt_key:
-            url: https://download.docker.com/linux/ubuntu/gpg
-            keyring: /usr/share/keyrings/docker.gpg 
-          when: containerd_keyring_present.stat.exists != 'true'
-
-        - name: Retreive dpkg architecture 
-          ansible.builtin.shell: "echo $(dpkg --print-architecture)"
-          register: dpkg_architecture
-          changed_when: false
-          ignore_errors: true
-
-        - name: The containerd repo
-          ansible.builtin.shell: "echo 'deb [arch={{ dpkg_architecture.stdout }} signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable' | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null"
-          changed_when: false
-          ignore_errors: true
-
-        - name: Installing containerd runtime
-          ansible.builtin.apt:
-            name: containerd
-            state: present
-        
-        - name: Make the directory
-          ansible.builtin.file:
-            path: /etc/containerd
-            state: directory
-
-        - name: Generate CNI configurations
-          ansible.builtin.shell: "containerd config default > /etc/containerd/config.toml"
-        
-        - name: Change the systemd driver of containerd
-          ansible.builtin.replace:
-            path: /etc/containerd/config.toml
-            regexp: 'SystemdCgroup = false'
-            replace: 'SystemdCgroup = true'
-            
-    - name: Changing the user permissions to access container socket
-      block:
-        - name: Setting up a group
-          ansible.builtin.group:
-            name: containerd
-            state: present
-        
-        - name: Retrive the group id
-          ansible.builtin.shell: "cat /etc/group | grep containerd | awk -F ':' '{print $3}'"
-          register: containerd_group_id
-
-        - name: Adding the user to the group
-          ansible.builtin.user: 
-            name: devuser
-            groups: containerd
-            append: yes
-        
-        - name: Add the group id in the config file 
-          ansible.builtin.replace:
-            path: /etc/containerd/config.toml
-            after: '[grpc]\n*address = "/run/containerd/containerd.sock"'
-            regexp: gid = 0
-            replace: 'gid = {{ containerd_group_id.stdout }}'
-
-        - name: Changing permission of the socket to the group
-          ansible.builtin.file: 
-            path: "/run/containerd/containerd.sock"
-            group: containerd
-
-    - name: Reloading the containerd service
-      ansible.builtin.service:
+    - name: install APT Transport HTTPS
+      apt:
+        name: apt-transport-https
+        state: present
+    - name: add Docker apt-key
+      get_url:
+        url: 'https://download.docker.com/linux/ubuntu/gpg'
+        dest: /etc/apt/keyrings/docker-apt-keyring.asc
+        mode: '0644'
+        force: true
+    - name: add Docker's APT repository
+      apt_repository:
+        repo: >-
+          deb [arch={{ 'amd64' if ansible_architecture == 'x86_64' else 'arm64' }} signed-by=/etc/apt/keyrings/docker-apt-keyring.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+        state: present
+        update_cache: 'yes'
+    - name: add Kubernetes apt-key
+      get_url:
+        url: 'https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key'
+        dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+        mode: '0644'
+        force: true
+    - name: add Kubernetes' APT repository
+      apt_repository:
+        repo: >-
+          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /
+        state: present
+        update_cache: 'yes'
+    - name: install Containerd
+      apt:
+        name: containerd.io
+        state: present
+    - name: create Containerd directory
+      file:
+        path: /etc/containerd
+        state: directory
+    - name: add Containerd configuration
+      shell: /usr/bin/containerd config default > /etc/containerd/config.toml
+    - name: configuring the systemd cgroup driver for Containerd
+      lineinfile:
+        path: /etc/containerd/config.toml
+        regexp: ' SystemdCgroup = false'
+        line: ' SystemdCgroup = true'
+    - name: enable the Containerd service and start it
+      systemd:
         name: containerd
         state: restarted
-        enabled: true
-
-    - name: Install dependent packages
-      ansible.builtin.apt:
-        name:
-          - apt-transport-https
-          - ca-certificates
-          - curl
-          - conntrack
+        enabled: 'yes'
+        daemon-reload: 'yes'
+    - name: install Kubelet
+      apt:
+        name: kubelet=1.29.*
         state: present
-
-    - name: Make the Keyring directory
-      ansible.builtin.file:
-        path: /usr/share/keyrings
-        state: directory
-        mode: 755
-
-    - name: Add the Apt repository /usr/share/keyrings/kubernetes-archive-keyring.gpg
-      block:
-        - name: Check if the keyring file is already present
-          ansible.builtin.stat:
-            path: /usr/share/keyrings/kubernetes-archive-keyring.gpg
-          register: gpg_key_present
-
-        - name: Add apt key
-          ansible.builtin.apt_key:
-            url: https://pkgs.k8s.io/core:/stable:/{{ kube_version }}/deb/Release.key
-            keyring: /usr/share/keyrings/kubernetes-archive-keyring.gpg
-          when: gpg_key_present.stat.exists != 'true'
-
-    - name: Add the Kubernetes Repository
-      ansible.builtin.apt_repository:
-        repo: deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://pkgs.k8s.io/core:/stable:/{{ kube_version }}/deb/ /
+        update_cache: true
+    - name: install Kubeadm
+      apt:
+        name: kubeadm=1.29.*
         state: present
-        filename: kubernetes
-    
-    - name: Perform an apt update
-      ansible.builtin.apt:
-        update_cache: yes
-
-    - name: Install the main kubeadm, kubelet, kubectl
-      ansible.builtin.apt:
-        name: 
-          - 'kubelet'
-          - 'kubeadm'
-          - 'kubectl'
+    - name: 'enable the Kubelet service, and enable it persistently'
+      service:
+        name: kubelet
+        enabled: 'yes'
+    - name: load br_netfilter kernel module
+      modprobe:
+        name: br_netfilter
         state: present
-      ignore_errors: true
-
-    - name: Making sure containerd service is started
-      ansible.builtin.service:
-        name: containerd
-        state: started
+    - name: set bridge-nf-call-iptables
+      sysctl:
+        name: net.bridge.bridge-nf-call-iptables
+        value: 1
+    - name: set ip_forward
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: 1
 
 - hosts: master
-  become: yes
+  become: 'yes'
   tasks:
-    - name: Initialize Kubernetes cluster
-      shell: kubeadm init --pod-network-cidr=10.244.0.0/16 --apiserver-advertise-address 192.168.56.113 
+    - name: install Kubectl
+      apt:
+        name: kubectl=1.29.*
+        state: present
+        force: 'yes'
 
-    - name: Create .kube directory
-      become: yes
-      become_user: vagrant
+- hosts: master
+  become: 'yes'
+  tasks:
+    - name: initialize the cluster (this could take some time)
+      shell: kubeadm init --pod-network-cidr=10.244.0.0/16 
+    - name: sleep for 30 seconds
+      wait_for:
+        timeout: 30
+    - name: create .kube directory
+      become: 'yes'
+      become_user: adminuser
       file:
         path: $HOME/.kube
         state: directory
-        mode: 0755
-
-    - name: Copy admin.conf to User's kube config
+        mode: 493
+    - name: copy admin.conf to user's kube config
       copy:
         src: /etc/kubernetes/admin.conf
-        dest: /home/vagrant/.kube/config
-        remote_src: yes
-        owner: vagrant
-
+        dest: /home/adminuser/.kube/config
+        remote_src: 'yes'
+        owner: adminuser
 
 - hosts: master
-  become: no
+  become: 'no'
   tasks:
     - name: Install Calico network plugin
-      command: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.25.0/manifests/calico.yaml
-      
-- name: Configure Join Commands on Master Node
-  hosts: master
-  become: yes
+      command: >-
+        kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.25.0/manifests/calico.yaml
+
+- hosts: master
+  become: 'yes'
   tasks:
-    - name: Retrieve Join Command
+    - name: get join command
       shell: kubeadm token create --print-join-command
       register: join_command_raw
-
-    - name: Set Join Command
+    - name: set join command
       set_fact:
-        join_command: "{{ join_command_raw.stdout_lines[0] }}"
+        join_command: '{{ join_command_raw.stdout_lines[0] }}'
 
-- name: Join Worker Nodes
-  hosts: workers
-  become: yes
+- hosts: worker
+  become: 'yes'
   tasks:
+    - name: TCP port 6443 on master is reachable from worker
+      wait_for:
+        host: '{{ hostvars[''master''].ansible_host }}'
+        port: 6443
+        timeout: 300
     - name: Set hostname to 'worker'
       shell: hostnamectl set-hostname worker
-      become: yes
-
-    - name: Delete /etc/kubernetes/pki/ca.crt
-      shell: rm -rf /etc/kubernetes/pki/ca.crt
-      become: yes
-
-    - name: Join worker to cluster
-      shell: "{{ hostvars['master'].join_command }}"
+      become: 'yes'
+    - name: Join cluster
+      shell: '{{ hostvars[''master''].join_command }}'
       args:
-        chdir: /home/vagrant
+        chdir: /home/adminuser
