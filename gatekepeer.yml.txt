@@ -1,0 +1,315 @@
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredlabels
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredLabels
+      validation:
+        openAPIV3Schema:
+          properties:
+            labels:
+              type: array
+              items: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequiredlabels
+        violation[{"msg": msg, "details": {"missing_labels": missing}}] {
+          provided := {label | input.review.object.metadata.labels[label]}
+          required := {label | label := input.parameters.labels[_]}
+          missing := required - provided
+          count(missing) > 0
+          msg := sprintf("you must provide labels: %v", [missing])
+        }
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredLabels
+metadata:
+  name: require-app-label
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+  parameters:
+    labels: ["app"]
+---
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8sallowedrepos
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sAllowedRepos
+      validation:
+        openAPIV3Schema:
+          properties:
+            repos:
+              type: array
+              items: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8sallowedrepos
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          image := container.image
+          not startswith(image, input.parameters.repos[_])
+          msg := sprintf("image '%v' comes from an untrusted registry", [image])
+        }
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sAllowedRepos
+metadata:
+  name: allow-official-repos-only
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+  parameters:
+    repos:
+      - "docker.io/official"
+      - "k8s.gcr.io"
+---
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredprobes
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredProbes
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequiredprobes
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          not container.livenessProbe
+          msg := sprintf("container '%v' must have a liveness probe", [container.name])
+        }
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          not container.readinessProbe
+          msg := sprintf("container '%v' must have a readiness probe", [container.name])
+        }
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredProbes
+metadata:
+  name: require-health-probes
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+---
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8sresourcelimits
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sResourceLimits
+      validation:
+        openAPIV3Schema:
+          properties:
+            cpu:
+              type: string
+            memory:
+              type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8sresourcelimits
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          not container.resources.limits.cpu
+          msg := sprintf("container '%v' must have a CPU limit", [container.name])
+        }
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          not container.resources.limits.memory
+          msg := sprintf("container '%v' must have a memory limit", [container.name])
+        }
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sResourceLimits
+metadata:
+  name: require-resource-limits
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+  parameters:
+    cpu: "200m"
+    memory: "512Mi"
+---
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8sblockprivilegedcontainers
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sBlockPrivilegedContainers
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8sblockprivilegedcontainers
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          container.securityContext.privileged
+          msg := sprintf("privileged containers are not allowed: %v", [container.name])
+        }
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sBlockPrivilegedContainers
+metadata:
+  name: block-privileged-containers
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+---
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8sallowedservicetypes
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sAllowedServiceTypes
+      validation:
+        openAPIV3Schema:
+          properties:
+            types:
+              type: array
+              items: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8sallowedservicetypes
+        violation[{"msg": msg}] {
+          service_type := input.review.object.spec.type
+          allowed_types := input.parameters.types
+          not service_type in allowed_types
+          msg := sprintf("service type '%v' is not allowed", [service_type])
+        }
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sAllowedServiceTypes
+metadata:
+  name: restrict-service-types
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Service"]
+  parameters:
+    types: ["ClusterIP", "NodePort"]
+---
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8senforceimagepullpolicy
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sEnforceImagePullPolicy
+      validation:
+        openAPIV3Schema:
+          properties:
+            policy:
+              type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8senforceimagepullpolicy
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          not container.imagePullPolicy = input.parameters.policy
+          msg := sprintf("container '%v' must have imagePullPolicy '%v'", [container.name, input.parameters.policy])
+        }
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sEnforceImagePullPolicy
+metadata:
+  name: enforce-always-pull-policy
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+  parameters:
+    policy: "Always"
+---
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8senforcepodantiaffinity
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sEnforcePodAntiAffinity
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8senforcepodantiaffinity
+        violation[{"msg": msg}] {
+          not input.review.object.spec.affinity.podAntiAffinity
+          msg := "Pod must have podAntiAffinity defined"
+        }
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sEnforcePodAntiAffinity
+metadata:
+  name: require-pod-anti-affinity
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+---
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8sforbiddenseccomp
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sForbiddenSeccomp
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8sforbiddenseccomp
+        violation[{"msg": msg}] {
+          input.review.object.spec.securityContext.seccompProfile.type = "Unconfined"
+          msg := "Unconfined seccomp profile is not allowed"
+        }
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sForbiddenSeccomp
+metadata:
+  name: forbid-unconfined-seccomp
+spec:
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
